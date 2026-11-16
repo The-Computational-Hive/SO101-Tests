@@ -25,6 +25,7 @@ def main():
             for label, address in [("Present_Voltage", 62),
                                    ("Min_Voltage_Limit", 15),
                                    ("Max_Voltage_Limit", 14),
+                                   ("Status", 65),
                                    ("Torque_Enable", 40)]:
                 value, result, error = packet.read1ByteTxRx(port, motor_id, address)
                 if result != scs.COMM_SUCCESS:
