@@ -83,7 +83,7 @@ def disable_all_torque(bus):
 class ArmController:
     """All serial calls run on one worker thread, never in Tk callbacks."""
 
-    def __init__(self, robot, limits, gains, max_lead=None):
+    def __init__(self, robot, limits, gains, max_lead=None, settle_tolerance=1.5):
         self.robot, self.limits, self.gains = robot, limits, gains
         self.max_lead = {key: 2.5 for key in limits}
         self.max_lead.update(max_lead or {})
@@ -91,6 +91,10 @@ class ArmController:
             raise ValueError("Command lead must be 2.5 or 3.0 for known joints")
         if self.max_lead.get("gripper.pos", 2.5) != 2.5:
             raise ValueError("Gripper command lead must remain 2.5 units")
+        if settle_tolerance not in (1.5, 2.0):
+            raise ValueError("Body endpoint tolerance must be 1.5 or 2.0 degrees")
+        self.settle_tolerance = settle_tolerance
+        self.endpoint_offsets = {}
         self.enabled = False
         self.original_gains = {}
         self.commanded = {}
@@ -150,6 +154,7 @@ class ArmController:
             self.robot.bus.enable_torque()
             self.commanded = actual.copy()
             self.lag_since.clear()
+            self.endpoint_offsets.clear()
             self.enabled = True
             return actual
         except Exception:
@@ -158,6 +163,7 @@ class ArmController:
 
     def stop(self):
         self.enabled = False  # Prevent further actions even if serial cleanup fails.
+        self.endpoint_offsets.clear()
         errors = []
         try:
             disable_all_torque(self.robot.bus)
@@ -182,11 +188,21 @@ class ArmController:
             return actual
         desired = bounded_targets(desired, self.limits)
         candidate = ramp_targets(self.commanded, desired, dt, speed, gripper_speed)
+        self.endpoint_offsets.clear()
         for key, value in self.commanded.items():
             error = abs(actual[key] - value)
             if error > 5.0:
                 self.tracking_failure(key, actual, desired, "tracking error exceeded 5")
-            if error > 1.5:
+            at_endpoint = abs(desired[key] - value) < 1e-6
+            small_final_offset = (key != "gripper.pos" and at_endpoint
+                                  and 1.5 < error <= self.settle_tolerance)
+            if small_final_offset:
+                # This is an explicit endpoint-accuracy allowance, not success.
+                # Keep the target and effort unchanged, display the residual,
+                # and continue all motor/temperature/communication checks.
+                self.endpoint_offsets[key] = actual[key] - desired[key]
+                self.lag_since.pop(key, None)
+            elif error > 1.5:
                 direction = 1 if value > actual[key] else -1
                 anchor = self.lag_since.get(key)
                 # Measure physical progress toward the command, not just absolute
@@ -246,6 +262,7 @@ class SliderApp:
         self.shared = {"targets": {}, "speed": 2 / 3, "gripper_speed": 2.0, "heartbeat": time.monotonic()}
         self.connected = self.enabled = self.closing = self.locked_out = False
         self.status = tk.StringVar(value="Connect, then support the arm and enable holding.")
+        self.offset_warning = tk.StringVar(value="")
         self.speed = tk.DoubleVar(value=2 / 3)
         self.gripper_speed = tk.DoubleVar(value=2.0)
         self.values, self.readouts, self.sliders, self.limit_labels = {}, {}, {}, {}
@@ -256,6 +273,7 @@ class SliderApp:
         ttk.Label(frame, text="SO101 joint control", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(frame, text=f"{args.port}  |  {args.robot_id}  |  Shoulder P={args.shoulder_p}, elbow P={args.elbow_p}").pack(anchor="w")
         ttk.Label(frame, text=f"Command lead: shoulder ≤{args.shoulder_lead:g}°, elbow ≤{args.elbow_lead:g}°; others retain 2.5.").pack(anchor="w")
+        ttk.Label(frame, text=f"Body endpoint allowance: {args.settle_tolerance:g}°; larger offsets still trigger tracking checks.").pack(anchor="w")
         ttk.Label(frame, text="Secure the base. Limits do not prevent collisions. Support the arm before torque off.").pack(anchor="w", pady=(4, 12))
         rows = ttk.Frame(frame)
         rows.pack(fill="x")
@@ -290,6 +308,7 @@ class SliderApp:
         self.hold_button.pack(side="left", padx=8)
         tk.Button(buttons, text="STOP — TORQUE OFF (Esc)", bg="#b42318", fg="white", command=self.stop).pack(side="right")
         ttk.Label(frame, textvariable=self.status, wraplength=800).pack(anchor="w", pady=8)
+        tk.Label(frame, textvariable=self.offset_warning, fg="#9a5700", anchor="w", justify="left", wraplength=800).pack(anchor="w")
         root.bind("<Escape>", lambda event: self.stop())
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.worker = threading.Thread(target=self.work, daemon=False)
@@ -342,6 +361,8 @@ class SliderApp:
                     self.limit_labels[key].configure(text=f"{key.removesuffix('.pos')}\n{low:.1f} to {high:.1f} {unit}")
             elif kind == "state":
                 self.enabled = data
+                if not data:
+                    self.offset_warning.set("")
             elif kind == "lockout":
                 self.locked_out = True
                 self.enabled = False
@@ -359,6 +380,12 @@ class SliderApp:
                     self.readouts[key].set(f"Actual {value:.1f}{unit} | Target {self.values[key].get():.1f} | Sent {commanded.get(key, value):.1f}")
                     if not self.enabled:
                         self.values[key].set(value)
+            elif kind == "offsets":
+                if self.enabled and data:
+                    details = ", ".join(f"{key.removesuffix('.pos')}: {error:+.2f}°" for key, error in data.items())
+                    self.offset_warning.set("Holding with residual position error: " + details + ". Target not reached precisely.")
+                else:
+                    self.offset_warning.set("")
             elif kind == "status":
                 self.status.set(data)
             elif kind == "error":
@@ -419,7 +446,8 @@ class SliderApp:
                             if not robot.is_calibrated:
                                 raise RuntimeError("Saved calibration does not match the motors.")
                             limits = calibrated_limits(robot.calibration)
-                        controller = ArmController(robot, limits, {"shoulder_lift": self.args.shoulder_p, "elbow_flex": self.args.elbow_p}, max_lead=leads)
+                        controller = ArmController(robot, limits, {"shoulder_lift": self.args.shoulder_p, "elbow_flex": self.args.elbow_p},
+                                                   max_lead=leads, settle_tolerance=self.args.settle_tolerance)
                         faulted = False
                         self.updates.put(("limits", limits))
                         self.updates.put(("status", "Connected; torque off. Support the arm, then enable."))
@@ -461,6 +489,7 @@ class SliderApp:
                             controller.health()
                             last_health = now
                         self.updates.put(("pose", (actual, controller.commanded.copy(), controller.limits)))
+                        self.updates.put(("offsets", controller.endpoint_offsets.copy()))
                     elif controller:
                         # Keep measured positions live after a stop, without sending actions.
                         try:
@@ -587,6 +616,8 @@ def main():
                         help="Shoulder command lead in degrees; 3.0 is an opt-in experiment (default: 2.5).")
     parser.add_argument("--elbow-lead", type=float, choices=(2.5, 3.0), default=2.5,
                         help="Elbow command lead in degrees; 3.0 is an opt-in experiment (default: 2.5).")
+    parser.add_argument("--settle-tolerance", type=float, choices=(1.5, 2.0), default=1.5,
+                        help="Opt in to holding body endpoints with up to 2 degrees of residual error and a visible warning; default: 1.5. Does not apply during trajectories or to gripper.")
     parser.add_argument("--demo", action="store_true", help="Preview sliders without connecting a robot.")
     args = parser.parse_args()
     root = tk.Tk()

@@ -85,6 +85,17 @@ lead to 3.0 degrees. It has not yet been physically tested. A larger permitted
 position error can produce more corrective effort and stored mechanical energy;
 this experiment does not change torque ceilings or current protection.
 
+A later elbow failure during two-joint motion has `desired=commanded=-38.332`,
+actual=-36.659, error=1.673 degrees, P=36, lead=3.0, full torque ceilings, and
+status 0. This is a final-target offset; the lead cap is not limiting the command.
+The UI now offers `--settle-tolerance 2.0` as an explicit alternative to the
+default 1.5 degrees. At a body joint's final commanded destination only, residual
+errors over 1.5 and up to 2.0 degrees may keep holding with an amber warning.
+This does not declare precise target attainment or increase force. Unfinished
+trajectories, gripper behavior, larger endpoint errors, and all health checks
+retain their existing stop behavior. The existing fixed-trajectory test's pass
+criteria are unchanged.
+
 Startup configuration follows LeRobot's settings: body P=16, I=0, D=32 before
 explicit overrides. Gripper protection is deliberately reduced to max torque
 500, protection current 250, overload torque 25. This is gripper-specific and

@@ -122,6 +122,51 @@ class SliderChecks(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ArmController(base.robot, base.limits, base.gains, leads)
 
+    def test_recorded_small_endpoint_offset_is_visible_and_can_keep_holding(self):
+        base = self.make_controller()
+        controller = ArmController(base.robot, base.limits, base.gains, settle_tolerance=2.0)
+        controller.enable()
+        desired = controller.commanded.copy()
+        desired["elbow_flex.pos"] = -38.332
+        controller.commanded = desired.copy()
+        controller.robot.positions["elbow_flex.pos"] = -36.659
+        with patch.object(controller.robot, "send_action", side_effect=lambda action: action.copy()):
+            for now in (1, 5, 9):
+                controller.tick(desired, 0.1, 1, 2, now=now)
+        self.assertAlmostEqual(controller.endpoint_offsets["elbow_flex.pos"], 1.673)
+        self.assertEqual(controller.commanded["elbow_flex.pos"], -38.332)
+        self.assertNotIn("elbow_flex.pos", controller.lag_since)
+        self.assertTrue(controller.enabled)
+        controller.stop()
+        self.assertFalse(controller.endpoint_offsets)
+
+    def assert_offset_stops(self, joint, command, actual, desired_value, tolerance):
+        base = self.make_controller()
+        controller = ArmController(base.robot, base.limits, base.gains, settle_tolerance=tolerance)
+        controller.enable()
+        desired = controller.commanded.copy()
+        key = f"{joint}.pos"
+        controller.commanded[key] = command
+        desired[key] = desired_value
+        controller.robot.positions[key] = actual
+        with patch.object(controller.robot, "send_action", side_effect=lambda action: action.copy()):
+            controller.tick(desired, 0.1, 1, 2, now=1)
+            with self.assertRaisesRegex(RuntimeError, "not tracking"):
+                controller.tick(desired, 0.1, 1, 2, now=5)
+        controller.stop()
+
+    def test_endpoint_allowance_is_opt_in(self):
+        self.assert_offset_stops("elbow_flex", -38.332, -36.659, -38.332, 1.5)
+
+    def test_larger_final_offsets_still_stop(self):
+        self.assert_offset_stops("elbow_flex", -38.332, -36.0, -38.332, 2.0)
+
+    def test_small_offset_during_unfinished_trajectory_still_stops(self):
+        self.assert_offset_stops("elbow_flex", -38.332, -36.659, -45, 2.0)
+
+    def test_gripper_does_not_inherit_body_endpoint_allowance(self):
+        self.assert_offset_stops("gripper", 20, 21.7, 20, 2.0)
+
     def test_moving_joint_with_offset_is_not_reported_as_stuck(self):
         controller = self.make_controller()
         controller.enable()
