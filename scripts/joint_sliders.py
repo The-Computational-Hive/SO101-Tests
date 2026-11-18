@@ -101,13 +101,15 @@ class ArmController:
         self.lag_since = {}
         self.shutdown_failed = False
 
-    def tracking_failure(self, key, actual, desired, reason):
+    def tracking_failure(self, key, actual, desired, reason, final_target=None):
         joint = key.removesuffix(".pos")
         unit = "units" if joint == "gripper" else "degrees"
         details = (f"{joint}: {reason}; desired={desired[key]:.3f}, "
                    f"commanded={self.commanded[key]:.3f}, actual={actual[key]:.3f}, "
                    f"error={actual[key] - self.commanded[key]:+.3f} {unit}, "
                    f"lead_limit={self.max_lead[key]:.1f}")
+        if final_target is not None:
+            details += f", final_target={final_target:.3f}"
         readings = []
         for register in ("Goal_Position", "Torque_Enable", "P_Coefficient", "I_Coefficient", "D_Coefficient",
                          "Max_Torque_Limit", "Torque_Limit", "Protection_Current",
@@ -182,25 +184,33 @@ class ArmController:
         if errors:
             raise RuntimeError("; ".join(errors))
 
-    def tick(self, desired, dt, speed, gripper_speed, now):
+    def tick(self, desired, dt, speed, gripper_speed, now, *, endpoint_target=None):
         actual = self.pose()
         if not self.enabled:
             return actual
         desired = bounded_targets(desired, self.limits)
+        endpoint = desired if endpoint_target is None else bounded_targets(endpoint_target, self.limits)
         candidate = ramp_targets(self.commanded, desired, dt, speed, gripper_speed)
         self.endpoint_offsets.clear()
         for key, value in self.commanded.items():
             error = abs(actual[key] - value)
             if error > 5.0:
-                self.tracking_failure(key, actual, desired, "tracking error exceeded 5")
-            at_endpoint = abs(desired[key] - value) < 1e-6
+                self.tracking_failure(key, actual, desired, "tracking error exceeded 5", endpoint[key])
+            # Cartesian callers stream intermediate setpoints. Compare against
+            # the actual final destination, with one encoder count of tolerance,
+            # rather than requiring floating-point equality with each setpoint.
+            endpoint_resolution = 360 / 4095 + 1e-6
+            at_endpoint = (abs(endpoint[key] - value) <= endpoint_resolution
+                           and abs(endpoint[key] - desired[key]) <= endpoint_resolution)
+            final_error = abs(actual[key] - endpoint[key])
             small_final_offset = (key != "gripper.pos" and at_endpoint
-                                  and 1.5 < error <= self.settle_tolerance)
+                                  and 1.5 < error <= self.settle_tolerance
+                                  and final_error <= self.settle_tolerance)
             if small_final_offset:
                 # This is an explicit endpoint-accuracy allowance, not success.
                 # Keep the target and effort unchanged, display the residual,
                 # and continue all motor/temperature/communication checks.
-                self.endpoint_offsets[key] = actual[key] - desired[key]
+                self.endpoint_offsets[key] = actual[key] - endpoint[key]
                 self.lag_since.pop(key, None)
             elif error > 1.5:
                 direction = 1 if value > actual[key] else -1
@@ -214,7 +224,7 @@ class ArmController:
                     # A cancellation/reversal is reducing the commanded error.
                     self.lag_since.pop(key, None)
                 elif now - anchor[0] > 3.0:
-                    self.tracking_failure(key, actual, desired, "not tracking: less than 0.25 units of progress in 3 seconds")
+                    self.tracking_failure(key, actual, desired, "not tracking: less than 0.25 units of progress in 3 seconds", endpoint[key])
             else:
                 self.lag_since.pop(key, None)
             # Keep the command inside its selected lead allowance and below

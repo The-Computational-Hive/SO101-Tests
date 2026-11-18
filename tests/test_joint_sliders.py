@@ -140,6 +140,53 @@ class SliderChecks(unittest.TestCase):
         controller.stop()
         self.assertFalse(controller.endpoint_offsets)
 
+    def test_recorded_near_endpoint_rounding_does_not_trigger_expired_watchdog(self):
+        base = self.make_controller()
+        controller = ArmController(base.robot, base.limits, base.gains, settle_tolerance=2.0)
+        controller.enable()
+        desired = controller.commanded.copy()
+        key = "elbow_flex.pos"
+        controller.commanded[key] = 22.469
+        desired[key] = 22.468
+        controller.robot.positions[key] = 24.0
+        controller.lag_since[key] = (0., 24., -1)
+        with patch.object(controller.robot, "send_action", side_effect=lambda action: action.copy()):
+            controller.tick(desired, 0.05, 2 / 3, 2., now=5, endpoint_target=desired)
+        self.assertNotIn(key, controller.lag_since)
+        self.assertAlmostEqual(controller.endpoint_offsets[key], 1.532)
+        self.assertTrue(controller.enabled)
+        controller.stop()
+
+    def test_close_intermediate_setpoint_is_not_mistaken_for_final_destination(self):
+        base = self.make_controller()
+        controller = ArmController(base.robot, base.limits, base.gains, settle_tolerance=2.0)
+        controller.enable()
+        desired = controller.commanded.copy()
+        key = "elbow_flex.pos"
+        controller.commanded[key] = 22.0
+        desired[key] = 21.99
+        endpoint = {**desired, key: 10.0}
+        controller.robot.positions[key] = 23.7
+        controller.lag_since[key] = (0., 23.7, -1)
+        with patch.object(controller.robot, "send_action", side_effect=lambda action: action.copy()):
+            with self.assertRaisesRegex(RuntimeError, "not tracking"):
+                controller.tick(desired, 0.05, 2 / 3, 2., now=5, endpoint_target=endpoint)
+        controller.stop()
+
+    def test_near_endpoint_does_not_expand_two_degree_actual_error_allowance(self):
+        base = self.make_controller()
+        controller = ArmController(base.robot, base.limits, base.gains, settle_tolerance=2.0)
+        controller.enable()
+        desired = controller.commanded.copy()
+        key = "elbow_flex.pos"
+        desired[key] = -0.05
+        controller.robot.positions[key] = 1.99
+        controller.lag_since[key] = (0., 1.99, -1)
+        with patch.object(controller.robot, "send_action", side_effect=lambda action: action.copy()):
+            with self.assertRaisesRegex(RuntimeError, "not tracking"):
+                controller.tick(desired, 0.05, 2 / 3, 2., now=5, endpoint_target=desired)
+        controller.stop()
+
     def assert_offset_stops(self, joint, command, actual, desired_value, tolerance):
         base = self.make_controller()
         controller = ArmController(base.robot, base.limits, base.gains, settle_tolerance=tolerance)
